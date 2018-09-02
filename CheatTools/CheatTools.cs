@@ -252,7 +252,8 @@ namespace CheatTools
                             new KeyValuePair<object, string>(talkScene, "TalkScene"),
                             new KeyValuePair<object, string>(Studio.Studio.Instance, "Studio.Instance"),
                             new KeyValuePair<object, string>(_gameMgr.transform.root.GetComponents<object>(), "Game Root"),
-                        })
+							new KeyValuePair<object, string>(hSprite, "HSprite(α)"),
+						})
                         {
                             if (obj.Key == null) continue;
                             if (GUILayout.Button(obj.Value))
