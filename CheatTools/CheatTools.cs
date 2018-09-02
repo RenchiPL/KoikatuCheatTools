@@ -4,29 +4,38 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
+using BepInEx.Logging;
 using UnityEngine;
+using Logger = BepInEx.Logger;
 
 namespace CheatTools
 {
-    [BepInPlugin("CheatTools", "Cheat Tools", "1.2")]
+    [BepInPlugin("CheatTools", "Cheat Tools", "1.6")]
     public partial class CheatTools : BaseUnityPlugin
     {
-        private readonly int inspectorTypeWidth = 170, inspectorNameWidth = 200;
-        private readonly int screenOffset = 20;
-        private Dictionary<Type, bool> CanCovertCache = new Dictionary<Type, bool>();
-        private object currentlyEditingTag;
-        private string currentlyEditingText;
-        private List<ICacheEntry> fieldCache = new List<ICacheEntry>();
-        private Manager.Game gameMgr;
-        private string[] hExpNames = { "First time", "Inexperienced", "Used to", "Perverted" };
-        private Vector2 inspectorScrollPos, cheatsScrollPos;
-        private Stack<InspectorStackEntry> inspectorStack = new Stack<InspectorStackEntry>();
-        private string mainWindowTitle;
-        private InspectorStackEntry nextToPush;
-        private Rect screenRect;
-        private bool showGui = false;
-        private bool userHasHitReturn;
-        private Rect windowRect, windowRect2;
+        private const int InspectorTypeWidth = 170, InspectorNameWidth = 240;
+        private int _inspectorValueWidth;
+        private const int ScreenOffset = 20;
+        private readonly string[] _hExpNames = { "First time", "Inexperienced", "Experienced", "Perverted" };
+
+        private Rect _screenRect;
+        private bool _showGui;
+        private bool _userHasHitReturn;
+        private Rect _windowRect, _windowRect2;
+        private Vector2 _inspectorScrollPos, _cheatsScrollPos, _inspectorStackScrollPos;
+        private string _mainWindowTitle;
+
+        private readonly Dictionary<Type, bool> _canCovertCache = new Dictionary<Type, bool>();
+        private readonly List<ICacheEntry> _fieldCache = new List<ICacheEntry>();
+
+        private readonly Stack<InspectorStackEntry> _inspectorStack = new Stack<InspectorStackEntry>();
+        private InspectorStackEntry _nextToPush;
+        private object _currentlyEditingTag;
+        private string _currentlyEditingText;
+
+        private Manager.Game _gameMgr;
+        private SaveData.Heroine _currentVisibleGirl;
 
         private static void DrawSeparator()
         {
@@ -35,58 +44,136 @@ namespace CheatTools
 
         private static string ExtractText(object value)
         {
-            if (value is string str) return str;
+            if (value == null) return "NULL";
+            switch (value)
+            {
+                case string str:
+                    return str;
+                case Transform t:
+                    return t.name;
+                case GameObject o:
+                    return o.name;
+                case SaveData.Heroine heroine:
+                    return heroine.Name;
+                case SaveData.CharaData.Params.Data d:
+                    return $"[{d.key} | {d.value}]";
+                case ICollection collection:
+                    return $"Count = {collection.Count}";
+                case IEnumerable _:
+                    return "IS ENUMERABLE";
+                default:
+                    {
+                        var valueType = value.GetType();
+                        try
+                        {
+                            if (valueType.IsGenericType)
+                            {
+                                var baseType = valueType.GetGenericTypeDefinition();
+                                if (baseType == typeof(KeyValuePair<,>))
+                                {
+                                    //var argTypes = baseType.GetGenericArguments();
+                                    var kvpKey = valueType.GetProperty("Key")?.GetValue(value, null);
+                                    var kvpValue = valueType.GetProperty("Value")?.GetValue(value, null);
+                                    return $"[{ExtractText(kvpKey)} | {ExtractText(kvpValue)}]";
+                                }
+                            }
 
-            if (value is ICollection collection) return $"Count = {collection.Count}";
-
-            if (value is IEnumerable enumerable) return "IS ENUMERABLE";
-
-            if (value is SaveData.Heroine heroine) return heroine.Name;
-
-            return value?.ToString() ?? "NULL";
+                            return value.ToString();
+                        }
+                        catch
+                        {
+                            return valueType.Name;
+                        }
+                    }
+            }
         }
 
         private void CacheFields(object o)
         {
             try
             {
-                fieldCache.Clear();
+                _fieldCache.Clear();
                 if (o != null)
                 {
-                    if (o is IEnumerable enumerable)
+                    /*if (o is Transform t)
                     {
-                        fieldCache.AddRange(enumerable.Cast<object>().Select((x, y) => new ListCacheEntry(x, y)).Cast<ICacheEntry>());
+                        _fieldCache
+                    }*/
+
+                    if (!(o is Transform) && !(o is string) && o is IEnumerable enumerable)
+                    {
+                        _fieldCache.AddRange(enumerable.Cast<object>().Select((x, y) => x is ICacheEntry ? x : new ListCacheEntry(x, y)).Cast<ICacheEntry>());
                     }
                     else
                     {
-                        Type type = o.GetType();
-                        fieldCache.AddRange(type.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).Select(f => new FieldCacheEntry(o, f)).Cast<ICacheEntry>());
-                        fieldCache.AddRange(type.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).Select(p => new PropertyCacheEntry(o, p)).Cast<ICacheEntry>());
+                        var type = o.GetType();
+                        if (type == typeof(string))
+                            _fieldCache.Add(new ReadonlyCacheEntry("this", o));
+
+                        _fieldCache.AddRange(type.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy)
+                            .Where(f => !f.IsDefined(typeof(CompilerGeneratedAttribute), false))
+                            .Select(f => new FieldCacheEntry(o, f)).Cast<ICacheEntry>());
+                        _fieldCache.AddRange(type.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy)
+                            .Where(f => !f.IsDefined(typeof(CompilerGeneratedAttribute), false))
+                            .Select(p => new PropertyCacheEntry(o, p)).Cast<ICacheEntry>());
+
+                        _fieldCache.AddRange(type.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.FlattenHierarchy)
+                            .Where(f => !f.IsDefined(typeof(CompilerGeneratedAttribute), false))
+                            .Select(f => new FieldCacheEntry(null, f)).Cast<ICacheEntry>());
+                        _fieldCache.AddRange(type.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.FlattenHierarchy)
+                            .Where(f => !f.IsDefined(typeof(CompilerGeneratedAttribute), false))
+                            .Select(p => new PropertyCacheEntry(null, p)).Cast<ICacheEntry>());
+
+                        _fieldCache.AddRange(CacheMethods(o, type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy)));
+                        _fieldCache.AddRange(CacheMethods(null, type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.FlattenHierarchy)));
                     }
                 }
 
-                inspectorScrollPos = Vector2.zero;
+                _inspectorScrollPos = Vector2.zero;
             }
             catch (Exception ex)
             {
-                BepInLogger.Log("Inspector crash: " + ex.ToString());
+                Logger.Log(LogLevel.Warning, "Inspector CacheFields crash: " + ex);
             }
+        }
+
+        private static IEnumerable<ICacheEntry> CacheMethods(object o, MethodInfo[] typesToCheck)
+        {
+            var cacheItems = typesToCheck
+                .Where(x => !x.IsConstructor && !x.IsSpecialName && x.ReturnType != typeof(void) && x.GetParameters().Length == 0)
+                .Where(f => !f.IsDefined(typeof(CompilerGeneratedAttribute), false))
+                .Where(x => x.Name != "MemberwiseClone" && x.Name != "obj_address") // Instant game crash
+                .Select(m =>
+                {
+                    if (m.ContainsGenericParameters)
+                        try
+                        {
+                            return m.MakeGenericMethod(typeof(UnityEngine.Object));
+                        }
+                        catch (Exception)
+                        {
+                            return null;
+                        }
+                    return m;
+                }).Where(x => x != null)
+                .Select(m => new MethodCacheEntry(o, m)).Cast<ICacheEntry>();
+            return cacheItems;
         }
 
         private Boolean CanCovert(string value, Type type)
         {
-            if (CanCovertCache.ContainsKey(type))
-                return CanCovertCache[type];
+            if (_canCovertCache.ContainsKey(type))
+                return _canCovertCache[type];
 
             try
             {
-                var obj = Convert.ChangeType(value, type);
-                CanCovertCache[type] = true;
+                var _ = Convert.ChangeType(value, type);
+                _canCovertCache[type] = true;
                 return true;
             }
             catch
             {
-                CanCovertCache[type] = false;
+                _canCovertCache[type] = false;
                 return false;
             }
         }
@@ -95,14 +182,12 @@ namespace CheatTools
         {
             try
             {
-                // add club rating cheat (maybe dont change directly,
-                // add points as normal bonus and have player go write a report)
+                var hFlag = FindObjectOfType<HFlag>();
+                var talkScene = FindObjectOfType<TalkScene>();
 
-                // todo add time slider?
-
-                cheatsScrollPos = GUILayout.BeginScrollView(cheatsScrollPos);
+                _cheatsScrollPos = GUILayout.BeginScrollView(_cheatsScrollPos);
                 {
-                    if (!gameMgr.saveData.isOpening)
+                    if (_gameMgr != null && !_gameMgr.saveData.isOpening)
                     {
                         DrawPlayerCheats();
                     }
@@ -110,44 +195,31 @@ namespace CheatTools
                     {
                         GUILayout.Label("Start the game to see player cheats");
                     }
-
-                    DrawSeparator();
-
-                    if (GUILayout.Button("Open game state in inspector"))
-                    {
-                        InspectorClear();
-                        InspectorPush(new InspectorStackEntry(gameMgr, "Manager.Game.Instance"));
-                    }
-
-                    DrawSeparator();
-
-                    var hFlag = FindObjectOfType<HFlag>();
+                    
                     if (hFlag != null)
                     {
                         DrawHSceneCheats(hFlag);
                     }
 
-					//Now can quit first time H scene
-					var hSprite = FindObjectOfType<HSprite>();
-					if (hSprite != null)
-					{
-						if (GUILayout.Button("Quit H scene (alpha)"))
-						{
-							hSprite.btnEnd.onClick.Invoke();
-						}
-					}
-
-					DrawSeparator();
-
+                    //Now can quit first time H scene
+                    var hSprite = FindObjectOfType<HSprite>();
+                    if (hSprite != null)
+                    {
+                        if (GUILayout.Button("Quit H scene (alpha)"))
+                        {
+                            hSprite.btnEnd.onClick.Invoke();
+                        }
+                    }
+                    
                     GUILayout.BeginVertical(GUI.skin.box);
                     {
                         GUILayout.Label("Current girl stats");
 
-                        var currentAdvGirl = GetCurrentAdvHeroine();
+                        _currentVisibleGirl = GetCurrentAdvHeroine() ?? GetCurrentTalkSceneHeroine(talkScene) ?? GetCurrentHflagHeroine(hFlag) ?? _currentVisibleGirl;
 
-                        if (currentAdvGirl != null)
+                        if (_currentVisibleGirl != null)
                         {
-                            DrawCurrentHeroineCheats(currentAdvGirl);
+                            DrawCurrentHeroineCheats(_currentVisibleGirl);
                         }
                         else
                         {
@@ -156,27 +228,164 @@ namespace CheatTools
                     }
                     GUILayout.EndVertical();
 
-                    DrawSeparator();
-
-                    if (GUILayout.Button("Open heroine list in inspector"))
+                    GUILayout.BeginHorizontal(GUI.skin.box);
                     {
-                        InspectorClear();
-                        InspectorPush(new InspectorStackEntry(gameMgr.HeroineList, "Heroine list"));
+                        GUILayout.Label("Speed", GUILayout.ExpandWidth(false));
+                        GUILayout.Label((int)Math.Round(Time.timeScale * 100) + "%", GUILayout.Width(35));
+                        Time.timeScale = GUILayout.HorizontalSlider(Time.timeScale, 0, 5, GUILayout.ExpandWidth(true));
+                        if (GUILayout.Button("Reset", GUILayout.ExpandWidth(false)))
+                            Time.timeScale = 1;
+                    }
+                    GUILayout.EndHorizontal();
+                    
+                    GUILayout.BeginVertical(GUI.skin.box);
+                    {
+                        GUILayout.Label("Open in inspector");
+                        foreach (var obj in new[]
+                        {
+                            new KeyValuePair<object, string>(_gameMgr?.HeroineList.Select(x=>new ReadonlyCacheEntry(x.ChaName, x)), "Heroine list"),
+                            new KeyValuePair<object, string>(_gameMgr, "Manager.Game.Instance"),
+                            new KeyValuePair<object, string>(Manager.Scene.Instance, "Manager.Scene.Instance"),
+                            new KeyValuePair<object, string>(Manager.Communication.Instance, "Manager.Communication.Instance"),
+                            new KeyValuePair<object, string>(Manager.Sound.Instance, "Manager.Sound.Instance"),
+                            new KeyValuePair<object, string>(hFlag, "HFlag"),
+                            new KeyValuePair<object, string>(talkScene, "TalkScene"),
+                            new KeyValuePair<object, string>(Studio.Studio.Instance, "Studio.Instance"),
+                            new KeyValuePair<object, string>(_gameMgr.transform.root.GetComponents<object>(), "Game Root"),
+                        })
+                        {
+                            if (obj.Key == null) continue;
+                            if (GUILayout.Button(obj.Value))
+                            {
+                                InspectorClear();
+                                InspectorPush(new InspectorStackEntry(obj.Key, obj.Value));
+                            }
+                        }
+                        GUILayout.EndVertical();
                     }
 
                     DrawSeparator();
+
                     GUILayout.Label("Created by MarC0 @ HongFire");
                 }
                 GUILayout.EndScrollView();
-
-                //TODO guibutton to enable/disable full editor
             }
             catch (Exception ex)
             {
-                BepInLogger.Log("CheatWindow crash: " + ex.Message);
+                Logger.Log(LogLevel.Error, "[CheatTools] CheatWindow crash: " + ex.Message);
             }
 
             GUI.DragWindow();
+        }
+
+        private static IEnumerable<ReadonlyCacheEntry> GetTransformScanner()
+        {
+            Logger.Log(LogLevel.Debug, "[CheatTools] Looking for Transforms...");
+
+            var trt = typeof(Transform);
+            var types = GetAllComponentTypes().Where(x => trt.IsAssignableFrom(x));
+
+            foreach (var component in ScanComponentTypes(types, false))
+                yield return component;
+        }
+
+        private static IEnumerable<ReadonlyCacheEntry> GetMonoBehaviourScanner()
+        {
+            Logger.Log(LogLevel.Debug, "[CheatTools] Looking for MonoBehaviours...");
+
+            var mbt = typeof(MonoBehaviour);
+            var types = GetAllComponentTypes().Where(x => mbt.IsAssignableFrom(x));
+
+            foreach (var component in ScanComponentTypes(types, true))
+                yield return component;
+        }
+
+        private static IEnumerable<ReadonlyCacheEntry> GetComponentScanner()
+        {
+            Logger.Log(LogLevel.Debug, "[CheatTools] Looking for Components...");
+
+            var mbt = typeof(MonoBehaviour);
+            var trt = typeof(Transform);
+            var allComps = GetAllComponentTypes().ToList();
+            var types = allComps.Where(x => !mbt.IsAssignableFrom(x) && !trt.IsAssignableFrom(x));
+
+            foreach (var component in ScanComponentTypes(types, true))
+                yield return component;
+        }
+
+        private static IEnumerable<ReadonlyCacheEntry> ScanComponentTypes(IEnumerable<Type> types, bool noTransfroms)
+        {
+            var allObjects = from type in types
+                             let components = FindObjectsOfType(type).OfType<Component>()
+                             from component in components
+                             where !(noTransfroms && component is Transform)
+                             select component;
+
+            string GetTransformPath(Transform tr)
+            {
+                if (tr.parent != null)
+                    return GetTransformPath(tr.parent) + "/" + tr.name;
+                return tr.name;
+            }
+
+            foreach (var obj in allObjects.Distinct())
+                yield return new ReadonlyCacheEntry($"{GetTransformPath(obj.transform)} ({obj.GetType().Name})", obj);
+        }
+
+
+        private static IEnumerable<Type> GetAllComponentTypes()
+        {
+            var compType = typeof(Component);
+            return AppDomain.CurrentDomain.GetAssemblies()
+                .SelectMany(x =>
+                {
+                    try
+                    {
+                        return x.GetTypes();
+                    }
+                    catch (SystemException)
+                    {
+                        return Enumerable.Empty<Type>();
+                    }
+                })
+                .Where(t => t.IsClass && !t.IsAbstract && !t.ContainsGenericParameters)
+                .Where(compType.IsAssignableFrom);
+        }
+
+        private static IEnumerable<ReadonlyCacheEntry> GetInstanceClassScanner()
+        {
+            Logger.Log(LogLevel.Debug, "[CheatTools] Looking for class instances...");
+
+            var query = AppDomain.CurrentDomain.GetAssemblies()
+                .SelectMany(x =>
+                {
+                    try
+                    {
+                        return x.GetTypes();
+                    }
+                    catch (SystemException)
+                    {
+                        return Enumerable.Empty<Type>();
+                    }
+                })
+                .Where(t => t.IsClass && !t.IsAbstract && !t.ContainsGenericParameters);
+
+            foreach (var type in query)
+            {
+                object obj = null;
+                try
+                {
+                    obj = type.GetProperty("Instance",
+                            BindingFlags.Public | BindingFlags.Static | BindingFlags.FlattenHierarchy)
+                        ?.GetValue(null, null);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Log(LogLevel.Debug, ex.ToString());
+                }
+                if (obj != null)
+                    yield return new ReadonlyCacheEntry(type.Name + ".Instance", obj);
+            }
         }
 
         private static void DrawHSceneCheats(HFlag hFlag)
@@ -234,12 +443,17 @@ namespace CheatTools
                 }
                 GUILayout.EndVertical();
 
-                if (GUILayout.Button("Set all H experience to 99%"))
+                GUILayout.BeginHorizontal();
                 {
-                    currentAdvGirl.houshiExp = 99f;
-                    for (int i = 0; i < currentAdvGirl.hAreaExps.Length; i++)
-                        currentAdvGirl.hAreaExps[i] = 99f;
+                    GUILayout.Label("Set all H experience to");
+                    if (GUILayout.Button("0%"))
+                        SetGirlHExp(currentAdvGirl, 0f);
+                    if (GUILayout.Button("50%"))
+                        SetGirlHExp(currentAdvGirl, 50f);
+                    if (GUILayout.Button("99%"))
+                        SetGirlHExp(currentAdvGirl, 99f);
                 }
+                GUILayout.EndHorizontal();
 
                 if (GUILayout.Button("Reset conversation time"))
                 {
@@ -253,11 +467,11 @@ namespace CheatTools
                 currentAdvGirl.isFirstGirlfriend = GUILayout.Toggle(currentAdvGirl.isFirstGirlfriend, "isFirstGirlfriend");
                 currentAdvGirl.isGirlfriend = GUILayout.Toggle(currentAdvGirl.isGirlfriend, "isGirlfriend");
 
-                currentAdvGirl.denial.notCondom = GUILayout.Toggle(currentAdvGirl.denial.notCondom, "Denies no condom");
-                currentAdvGirl.denial.anal = GUILayout.Toggle(currentAdvGirl.denial.anal, "Denies anal");
-                currentAdvGirl.denial.aibu = GUILayout.Toggle(currentAdvGirl.denial.aibu, "Denies vibrator");
-                currentAdvGirl.denial.kiss = GUILayout.Toggle(currentAdvGirl.denial.kiss, "Denies kiss");
-                currentAdvGirl.denial.massage = GUILayout.Toggle(currentAdvGirl.denial.massage, "Denies strong massage");
+                currentAdvGirl.denial.kiss = GUILayout.Toggle(currentAdvGirl.denial.kiss, "Won't refuse kiss");
+                currentAdvGirl.denial.massage = GUILayout.Toggle(currentAdvGirl.denial.massage, "Won't refuse strong massage");
+                currentAdvGirl.denial.anal = GUILayout.Toggle(currentAdvGirl.denial.anal, "Won't refuse anal");
+                currentAdvGirl.denial.aibu = GUILayout.Toggle(currentAdvGirl.denial.aibu, "Won't refuse vibrator");
+                currentAdvGirl.denial.notCondom = GUILayout.Toggle(currentAdvGirl.denial.notCondom, "Insert w/o condom OK");
 
                 if (GUILayout.Button("Open current girl in inspector"))
                 {
@@ -268,33 +482,42 @@ namespace CheatTools
             GUILayout.EndVertical();
         }
 
-        private void DrawEditableValue(ICacheEntry field, object value)
+        private static void SetGirlHExp(SaveData.Heroine girl, float amount)
         {
-            bool isBeingEdited = currentlyEditingTag == field;
-            string text = isBeingEdited ? currentlyEditingText : ExtractText(value);
-            var result = GUILayout.TextField(text, GUILayout.ExpandWidth(true));
+            girl.houshiExp = amount;
+            for (var i = 0; i < girl.hAreaExps.Length; i++)
+                girl.hAreaExps[i] = amount;
+            for (var i = 0; i < girl.massageExps.Length; i++)
+                girl.massageExps[i] = amount;
+        }
+
+        private void DrawEditableValue(ICacheEntry field, object value, params GUILayoutOption[] layoutParams)
+        {
+            var isBeingEdited = _currentlyEditingTag == field;
+            var text = isBeingEdited ? _currentlyEditingText : ExtractText(value);
+            var result = GUILayout.TextField(text, layoutParams);
 
             if (!Equals(text, result) || isBeingEdited)
             {
-                if (userHasHitReturn)
+                if (_userHasHitReturn)
                 {
-                    currentlyEditingTag = null;
-                    userHasHitReturn = false;
+                    _currentlyEditingTag = null;
+                    _userHasHitReturn = false;
                     try
                     {
                         var converted = Convert.ChangeType(result, field.Type());
                         if (!Equals(converted, value))
-                            field.Set(converted);
+                            field.SetValue(converted);
                     }
                     catch (Exception ex)
                     {
-                        BepInLogger.Log("Failed to set value - " + ex.Message);
+                        Logger.Log(LogLevel.Error, "Failed to set value - " + ex.Message);
                     }
                 }
                 else
                 {
-                    currentlyEditingText = result;
-                    currentlyEditingTag = field;
+                    _currentlyEditingText = result;
+                    _currentlyEditingTag = field;
                 }
             }
         }
@@ -307,19 +530,19 @@ namespace CheatTools
 
                 GUILayout.BeginHorizontal();
                 {
-                    GUILayout.Label("STR: " + gameMgr.Player.physical, GUILayout.Width(60));
-                    gameMgr.Player.physical = (int)GUILayout.HorizontalSlider(gameMgr.Player.physical, 0, 100);
+                    GUILayout.Label("STR: " + _gameMgr.Player.physical, GUILayout.Width(60));
+                    _gameMgr.Player.physical = (int)GUILayout.HorizontalSlider(_gameMgr.Player.physical, 0, 100);
                     GUILayout.EndHorizontal();
                     GUILayout.BeginHorizontal();
                     {
-                        GUILayout.Label("INT: " + gameMgr.Player.intellect, GUILayout.Width(60));
-                        gameMgr.Player.intellect = (int)GUILayout.HorizontalSlider(gameMgr.Player.intellect, 0, 100);
+                        GUILayout.Label("INT: " + _gameMgr.Player.intellect, GUILayout.Width(60));
+                        _gameMgr.Player.intellect = (int)GUILayout.HorizontalSlider(_gameMgr.Player.intellect, 0, 100);
                     }
                     GUILayout.EndHorizontal();
                     GUILayout.BeginHorizontal();
                     {
-                        GUILayout.Label("H: " + gameMgr.Player.hentai, GUILayout.Width(60));
-                        gameMgr.Player.hentai = (int)GUILayout.HorizontalSlider(gameMgr.Player.hentai, 0, 100);
+                        GUILayout.Label("H: " + _gameMgr.Player.hentai, GUILayout.Width(60));
+                        _gameMgr.Player.hentai = (int)GUILayout.HorizontalSlider(_gameMgr.Player.hentai, 0, 100);
                     }
                     GUILayout.EndHorizontal();
 
@@ -335,7 +558,7 @@ namespace CheatTools
                                 if (Math.Abs(newVal - cycle.timer) > 0.09)
                                 {
                                     typeof(ActionGame.Cycle)
-                                        .GetField("_timer", BindingFlags.Instance | BindingFlags.NonPublic)
+                                        .GetField("_timer", BindingFlags.Instance | BindingFlags.NonPublic)?
                                         .SetValue(cycle, newVal);
                                 }
                             }
@@ -357,35 +580,36 @@ namespace CheatTools
 
                 if (GUILayout.Button("Add 10000 club points (+1 level)"))
                 {
-                    gameMgr.saveData.clubReport.comAdd += 10000;
+                    _gameMgr.saveData.clubReport.comAdd += 10000;
                 }
 
                 if (GUILayout.Button("Open player data in inspector"))
                 {
                     InspectorClear();
-                    InspectorPush(new InspectorStackEntry(gameMgr.saveData.player, "Player data"));
+                    InspectorPush(new InspectorStackEntry(_gameMgr.saveData.player, "Player data"));
                 }
             }
             GUILayout.EndVertical();
         }
 
-        private void DrawValue(object value)
+        private void DrawValue(object value, params GUILayoutOption[] layoutParams)
         {
-            GUILayout.TextArea(ExtractText(value), GUI.skin.label, GUILayout.ExpandWidth(true));
+            GUILayout.TextArea(ExtractText(value), GUI.skin.label, layoutParams);
         }
 
         private void DrawVariableName(ICacheEntry field)
         {
-            GUILayout.TextArea(field.Name(), GUI.skin.label, GUILayout.Width(inspectorNameWidth), GUILayout.MaxWidth(inspectorNameWidth));
+            GUILayout.TextArea(field.Name(), GUI.skin.label, GUILayout.Width(InspectorNameWidth), GUILayout.MaxWidth(InspectorNameWidth));
         }
 
-        private void DrawVariableNameEnterButton(ICacheEntry field, object value)
+        private void DrawVariableNameEnterButton(ICacheEntry field)
         {
-            if (GUILayout.Button(field.Name(), GUILayout.Width(inspectorNameWidth), GUILayout.MaxWidth(inspectorNameWidth)))
+            if (GUILayout.Button(field.Name(), _alignedButtonStyle, GUILayout.Width(InspectorNameWidth), GUILayout.MaxWidth(InspectorNameWidth)))
             {
-                if (value != null)
+                var val = field.EnterValue();
+                if (val != null)
                 {
-                    nextToPush = new InspectorStackEntry(value, field.Name());
+                    _nextToPush = new InspectorStackEntry(val, field.Name());
                 }
             }
         }
@@ -394,33 +618,43 @@ namespace CheatTools
         {
             try
             {
-                MonoBehaviour nowScene = gameMgr.actScene?.AdvScene?.nowScene;
-                SaveData.Heroine currentAdvGirl = nowScene?.GetType().GetField("m_TargetHeroine", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(nowScene) as SaveData.Heroine;
+                var nowScene = _gameMgr?.actScene?.AdvScene?.nowScene;
+                var currentAdvGirl = nowScene?.GetType().GetField("m_TargetHeroine", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(nowScene) as SaveData.Heroine;
                 return currentAdvGirl;
             }
             catch { return null; }
         }
 
+        private SaveData.Heroine GetCurrentHflagHeroine(HFlag hFlag)
+        {
+            return hFlag?.lstHeroine?.FirstOrDefault();
+        }
+
+        private SaveData.Heroine GetCurrentTalkSceneHeroine(TalkScene talkScene)
+        {
+            return talkScene?.targetHeroine;
+        }
+
         private string GetHExpText(SaveData.Heroine currentAdvGirl)
         {
-            return hExpNames[(int)currentAdvGirl.HExperience];
+            return _hExpNames[(int)currentAdvGirl.HExperience];
         }
 
         private void InspectorClear()
         {
-            inspectorStack.Clear();
+            _inspectorStack.Clear();
             CacheFields(null);
         }
 
         private void InspectorPop()
         {
-            inspectorStack.Pop();
-            CacheFields(inspectorStack.Peek().Instance);
+            _inspectorStack.Pop();
+            CacheFields(_inspectorStack.Peek().Instance);
         }
 
         private void InspectorPush(InspectorStackEntry o)
         {
-            inspectorStack.Push(o);
+            _inspectorStack.Push(o);
             CacheFields(o.Instance);
         }
 
@@ -432,58 +666,95 @@ namespace CheatTools
                 {
                     GUILayout.BeginHorizontal();
                     {
-                        if (GUILayout.Button("Exit the inspector"))
+                        if (GUILayout.Button("Close Inspector"))
                         {
                             InspectorClear();
                         }
-                        GUILayout.Label("To go deeper click on the variable names. Click on the list below to go back. To edit variables type in a new value and press enter.");
-                    }
-                    GUILayout.EndHorizontal();
-
-                    GUILayout.BeginHorizontal(GUI.skin.box);
-                    foreach (var item in inspectorStack.Reverse().ToArray())
-                    {
-                        if (GUILayout.Button(item.Name, GUILayout.ExpandWidth(false)))
+                        GUILayout.Label("Find");
+                        foreach (var obj in new[]
+                          {
+                            new KeyValuePair<object, string>(GetInstanceClassScanner().OrderBy(x=>x.Name()), "Instances"),
+                            new KeyValuePair<object, string>(GetComponentScanner().OrderBy(x=>x.Name()), "Components"),
+                            new KeyValuePair<object, string>(GetMonoBehaviourScanner().OrderBy(x=>x.Name()), "MonoBehaviours"),
+                            new KeyValuePair<object, string>(GetTransformScanner().OrderBy(x=>x.Name()), "Transforms"),
+//                            new KeyValuePair<object, string>(GetTypeScanner(_inspectorStack.Peek().GetType()).OrderBy(x=>x.Name()), _inspectorStack.Peek().GetType().ToString()+"s"),
+                        })
                         {
-                            while (inspectorStack.Peek() != item)
-                                InspectorPop();
-
-                            return;
+                            if (obj.Key == null) continue;
+                            if (GUILayout.Button(obj.Value))
+                            {
+                                InspectorClear();
+                                InspectorPush(new InspectorStackEntry(obj.Key, obj.Value));
+                            }
                         }
                     }
                     GUILayout.EndHorizontal();
+
+                    GUILayout.Label("To go deeper click on the variable names. Click on the list below to go back. To edit variables type in a new value and press enter.");
+
+                    _inspectorStackScrollPos = GUILayout.BeginScrollView(_inspectorStackScrollPos, true, false,
+                        GUI.skin.horizontalScrollbar, GUIStyle.none, GUIStyle.none, GUILayout.Height(46));
+                    {
+                        GUILayout.BeginHorizontal(GUI.skin.box, GUILayout.ExpandWidth(false), GUILayout.ExpandHeight(false));
+                        foreach (var item in _inspectorStack.Reverse().ToArray())
+                        {
+                            if (GUILayout.Button(item.Name, GUILayout.ExpandWidth(false)))
+                            {
+                                while (_inspectorStack.Peek() != item)
+                                    InspectorPop();
+
+                                return;
+                            }
+                        }
+                        GUILayout.EndHorizontal();
+                    }
+                    GUILayout.EndScrollView();
 
                     GUILayout.BeginVertical(GUI.skin.box);
                     {
                         GUILayout.BeginHorizontal();
                         {
-                            GUILayout.Label("Value type", GUI.skin.box, GUILayout.Width(inspectorTypeWidth));
-                            GUILayout.Label("Variable name", GUI.skin.box, GUILayout.Width(inspectorNameWidth));
+                            GUILayout.Label("Value type", GUI.skin.box, GUILayout.Width(InspectorTypeWidth));
+                            GUILayout.Label("Variable name", GUI.skin.box, GUILayout.Width(InspectorNameWidth));
                             GUILayout.Label("Value", GUI.skin.box, GUILayout.ExpandWidth(true));
                         }
                         GUILayout.EndHorizontal();
 
-                        inspectorScrollPos = GUILayout.BeginScrollView(inspectorScrollPos);
+                        _inspectorScrollPos = GUILayout.BeginScrollView(_inspectorScrollPos);
                         {
                             GUILayout.BeginVertical();
-
-                            foreach (var field in fieldCache)
+                            bool widthCalculated = false;
+                            foreach (var entry in _fieldCache)
                             {
                                 GUILayout.BeginHorizontal();
                                 {
-                                    GUILayout.Label(field.TypeName(), GUILayout.Width(inspectorTypeWidth), GUILayout.MaxWidth(inspectorTypeWidth));
+                                    GUILayout.Label(entry.TypeName(), GUILayout.Width(InspectorTypeWidth), GUILayout.MaxWidth(InspectorTypeWidth));
 
-                                    object value = field.Get();
+                                    var value = entry.GetValue();
 
-                                    if (field.Type().IsPrimitive)
-                                        DrawVariableName(field);
+                                    if (entry.CanEnterValue())
+                                        DrawVariableNameEnterButton(entry);
                                     else
-                                        DrawVariableNameEnterButton(field, value);
+                                        DrawVariableName(entry);
 
-                                    if (CanCovert(ExtractText(value), field.Type()) && field.CanSet())
-                                        DrawEditableValue(field, value);
-                                    else
-                                        DrawValue(value);
+                                    if (_fieldCache.Count < 200)
+                                    {
+                                        var widthParam = widthCalculated
+                                            ? GUILayout.Width(_inspectorValueWidth)
+                                            : GUILayout.ExpandWidth(true);
+
+                                        if (entry.CanSetValue() && CanCovert(ExtractText(value), entry.Type()))
+                                            DrawEditableValue(entry, value, widthParam);
+                                        else
+                                            DrawValue(value, widthParam);
+
+                                        // Calculate width only once
+                                        if (!widthCalculated && Event.current.type == EventType.Repaint)
+                                        {
+                                            _inspectorValueWidth = (int)GUILayoutUtility.GetLastRect().width;
+                                            widthCalculated = true;
+                                        }
+                                    }
                                 }
                                 GUILayout.EndHorizontal();
                             }
@@ -497,60 +768,77 @@ namespace CheatTools
             }
             catch (Exception ex)
             {
-                BepInLogger.Log("Inspector crash: " + ex.Message);
+                Logger.Log(LogLevel.Error, "[CheatTools] Inspector crash: " + ex);
+                InspectorClear();
             }
 
             GUI.DragWindow();
         }
 
-        private void OnGUI()
+        private object GetTypeScanner(Type type)
         {
-            if (!showGui) return;
+            throw new NotImplementedException();
+        }
 
-            Event e = Event.current;
-            if (e.keyCode == KeyCode.Return) userHasHitReturn = true;
+        protected void OnGUI()
+        {
+            if (!_showGui) return;
 
-            windowRect = GUILayout.Window(591, windowRect, CheatWindow, mainWindowTitle);
+            if (_alignedButtonStyle == null)
+                _alignedButtonStyle = new GUIStyle(GUI.skin.button)
+                {
+                    alignment = TextAnchor.MiddleLeft,
+                    wordWrap = true
+                };
 
-            if (inspectorStack.Count != 0)
-                windowRect2 = GUILayout.Window(592, windowRect2, InspectorWindow, "Inspector");
+            var e = Event.current;
+            if (e.keyCode == KeyCode.Return) _userHasHitReturn = true;
+
+            _windowRect = GUILayout.Window(591, _windowRect, CheatWindow, _mainWindowTitle);
+
+            if (_inspectorStack.Count != 0)
+                _windowRect2 = GUILayout.Window(592, _windowRect2, InspectorWindow, "Inspector");
         }
 
         private void SetWindowSizes()
         {
             int w = Screen.width, h = Screen.height;
-            screenRect = new Rect(screenOffset, screenOffset, w - screenOffset * 2, h - screenOffset * 2);
+            _screenRect = new Rect(ScreenOffset, ScreenOffset, w - ScreenOffset * 2, h - ScreenOffset * 2);
 
-            if (windowRect.IsDefault())
-                windowRect = new Rect(screenRect.width - 50 - 270, 100, 270, 380);
+            if (_windowRect.IsDefault())
+                _windowRect = new Rect(_screenRect.width - 50 - 270, 100, 270, 380);
 
-            if (windowRect2.IsDefault())
-                windowRect2 = new Rect(screenRect.width / 2 - 800 / 2, screenRect.height / 2 - 600 / 2, 800, 600);
-        }
-
-        private void Start()
-        {
-            gameMgr = Manager.Game.Instance;
-
-            mainWindowTitle = "Cheat Tools" + Assembly.GetExecutingAssembly().GetName().Version.ToString();
-        }
-
-        private void Update()
-        {
-            if (nextToPush != null)
+            if (_windowRect2.IsDefault())
             {
-                InspectorPush(nextToPush);
+                const int width = 800;
+                const int height = 600;
+                _windowRect2 = new Rect(_screenRect.width / 2 - width / 2, _screenRect.height / 2 - height / 2, width, height);
+            }
+        }
 
-                nextToPush = null;
+        protected void Start()
+        {
+            _gameMgr = Manager.Game.Instance;
+
+            _mainWindowTitle = "Cheat Tools" + Assembly.GetExecutingAssembly().GetName().Version;
+        }
+
+        private GUIStyle _alignedButtonStyle;
+
+        protected void Update()
+        {
+            if (_nextToPush != null)
+            {
+                InspectorPush(_nextToPush);
+
+                _nextToPush = null;
             }
 
             if (Input.GetKeyDown(KeyCode.F12))
             {
-                showGui = !showGui;
+                _showGui = !_showGui;
                 SetWindowSizes();
             }
-
-            if (!showGui) return;
         }
     }
 }
