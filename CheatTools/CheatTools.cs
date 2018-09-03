@@ -205,11 +205,27 @@ namespace CheatTools
                     var hSprite = FindObjectOfType<HSprite>();
                     if (hSprite != null)
                     {
-                        if (GUILayout.Button("Quit H scene (alpha)"))
+                        if (GUILayout.Button("Quit H scene (α)"))
                         {
                             hSprite.btnEnd.onClick.Invoke();
                         }
-                    }
+						if (GUILayout.Button("Do Insert (α)"))
+						{
+							hSprite.OnInsertClick();
+						}
+						if (GUILayout.Button("Do Insert no voice (α)"))
+						{
+							hSprite.OnInsertNoVoiceClick();
+						}
+						if (GUILayout.Button("Do Insert Anal (α)"))
+						{
+							hSprite.OnInsertAnalClick();
+						}
+						if (GUILayout.Button("Do Insert Anal no voice (α)"))
+						{
+							hSprite.OnInsertAnalNoVoiceClick();
+						}
+					}
                     
                     GUILayout.BeginVertical(GUI.skin.box);
                     {
@@ -237,8 +253,10 @@ namespace CheatTools
                             Time.timeScale = 1;
                     }
                     GUILayout.EndHorizontal();
-                    
-                    GUILayout.BeginVertical(GUI.skin.box);
+
+					var handCtrl = FindObjectOfType<HandCtrl>();
+
+					GUILayout.BeginVertical(GUI.skin.box);
                     {
                         GUILayout.Label("Open in inspector");
                         foreach (var obj in new[]
@@ -253,6 +271,7 @@ namespace CheatTools
                             new KeyValuePair<object, string>(Studio.Studio.Instance, "Studio.Instance"),
                             new KeyValuePair<object, string>(_gameMgr.transform.root.GetComponents<object>(), "Game Root"),
 							new KeyValuePair<object, string>(hSprite, "HSprite(α)"),
+							new KeyValuePair<object, string>(handCtrl, "HandCtrl(α)"),
 						})
                         {
                             if (obj.Key == null) continue;
